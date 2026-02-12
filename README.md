@@ -103,6 +103,8 @@ Paginated reading of consecutive turns from a session.
 
 ## Usage pattern
 
+The 4 tools are automatically exposed to the assistant via MCP — no extra instructions in `CLAUDE.md`, `AGENTS.md`, or similar files are needed. The server also provides `instructions` metadata through the MCP protocol to guide the assistant on effective usage.
+
 Search wide, then read deep:
 
 ```
