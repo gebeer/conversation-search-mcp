@@ -427,7 +427,161 @@ def _build_index(pattern: str) -> tuple[list[dict], bm25s.BM25 | None, dict[str,
 
 
 # ---------------------------------------------------------------------------
-# TASK 3: MCP Tools
+# Core index class
+# ---------------------------------------------------------------------------
+
+
+class ConversationIndex:
+    """In-memory BM25 index over JSONL conversation transcripts."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._retriever: bm25s.BM25 | None = None
+        self._corpus: list[dict] = []
+        self._conversations: dict[str, dict] = {}
+        self._session_files: dict[str, Path] = {}
+
+    def build(self, pattern: str) -> None:
+        """Build or rebuild the index from matching directories."""
+        corpus, retriever, conversations, session_files = _build_index(pattern)
+        with self._lock:
+            self._corpus = corpus
+            self._retriever = retriever
+            self._conversations = conversations
+            self._session_files = session_files
+
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        session_id: str | None = None,
+        project: str | None = None,
+    ) -> dict:
+        """BM25 keyword search across all conversation turns.
+
+        Returns dict with 'results', 'query', 'total'.
+        """
+        with self._lock:
+            retriever = self._retriever
+            corpus = self._corpus
+
+        if retriever is None or not corpus:
+            return {"results": [], "query": query, "total": 0}
+
+        query_tokens = bm25s.tokenize([query], stopwords="en")
+        k = min(limit * 3, len(corpus))
+        results, scores = retriever.retrieve(query_tokens, k=k)
+
+        search_results: list[dict] = []
+        for i in range(results.shape[1]):
+            if len(search_results) >= limit:
+                break
+            doc_idx = results[0, i]
+            score = float(scores[0, i])
+            if score <= 0:
+                continue
+            entry = corpus[doc_idx]
+            if session_id and entry.get("session_id") != session_id:
+                continue
+            if project and project.lower() not in entry.get("project", "").lower():
+                continue
+            search_results.append({
+                "session_id": entry["session_id"],
+                "project": entry.get("project", ""),
+                "turn_number": entry["turn_number"],
+                "score": round(score, 4),
+                "snippet": entry["text"][:300],
+                "timestamp": entry.get("timestamp", ""),
+            })
+
+        return {"results": search_results, "query": query, "total": len(search_results)}
+
+    def list_conversations(
+        self,
+        project: str | None = None,
+        limit: int = 50,
+    ) -> dict:
+        """List indexed sessions. Returns dict with 'conversations', 'total'."""
+        with self._lock:
+            conversations = dict(self._conversations)
+
+        conv_list = []
+        for sid, meta in conversations.items():
+            if project and project.lower() not in meta.get("project", "").lower():
+                continue
+            conv_list.append({"session_id": sid, **meta})
+
+        conv_list.sort(key=lambda c: c.get("last_timestamp", ""), reverse=True)
+        conv_list = conv_list[:limit]
+
+        return {"conversations": conv_list, "total": len(conv_list)}
+
+    def read_turn(self, session_id: str, turn_number: int) -> dict:
+        """Full-fidelity read of a single turn."""
+        with self._lock:
+            session_files = dict(self._session_files)
+
+        jsonl_path = session_files.get(session_id)
+        if jsonl_path is None:
+            return {"error": f"Unknown session_id: {session_id}"}
+
+        turns = _reparse_turns(jsonl_path)
+
+        if turn_number < 0 or turn_number >= len(turns):
+            return {"error": f"Turn {turn_number} out of range (session has {len(turns)} turns)"}
+
+        turn = turns[turn_number]
+        return {
+            "session_id": turn["session_id"],
+            "turn_number": turn["turn_number"],
+            "timestamp": turn["timestamp"],
+            "user_text": turn["user_text"],
+            "assistant_text": turn["assistant_text"],
+            "tools_used": turn["tools_used"],
+        }
+
+    def read_conversation(
+        self,
+        session_id: str,
+        offset: int = 0,
+        limit: int = 10,
+    ) -> dict:
+        """Paginated reading of turns from a session."""
+        with self._lock:
+            session_files = dict(self._session_files)
+            conversations = dict(self._conversations)
+
+        jsonl_path = session_files.get(session_id)
+        if jsonl_path is None:
+            return {"error": f"Unknown session_id: {session_id}"}
+
+        meta = conversations.get(session_id, {})
+        turns = _reparse_turns(jsonl_path)
+        sliced = turns[offset : offset + limit]
+
+        return {
+            "session_id": session_id,
+            "project": meta.get("project", ""),
+            "cwd": meta.get("cwd", ""),
+            "git_branch": meta.get("git_branch", ""),
+            "total_turns": len(turns),
+            "offset": offset,
+            "limit": limit,
+            "turns": [
+                {
+                    "turn_number": t["turn_number"],
+                    "timestamp": t["timestamp"],
+                    "user_text": t["user_text"],
+                    "assistant_text": t["assistant_text"],
+                    "tools_used": t["tools_used"],
+                }
+                for t in sliced
+            ],
+        }
+
+
+# ---------------------------------------------------------------------------
+# TASK 3: MCP Tools — registered inside _run_mcp_server()
 # ---------------------------------------------------------------------------
 
 @mcp_server.tool()
