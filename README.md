@@ -1,6 +1,6 @@
 # conversation-search
 
-MCP server that provides BM25 keyword search over Claude Code conversation history. Indexes JSONL transcripts from `~/.claude/projects/` and exposes them as searchable memory across sessions.
+BM25 keyword search over Claude Code conversation history. Indexes JSONL transcripts from `~/.claude/projects/` and exposes them as searchable memory. Available as both an MCP server and a CLI tool.
 
 Based on [Searchable Agent Memory in a Single File](https://eric-tramel.github.io/blog/2026-02-07-searchable-agent-memory/) by Eric Tramel.
 
@@ -38,7 +38,7 @@ Add to `.mcp.json` (project-level or `~/.claude/.mcp.json` for global):
   "mcpServers": {
     "conversation-search": {
       "command": "uv",
-      "args": ["run", "/absolute/path/to/conversation_search.py", "--pattern", "<pattern>"]
+      "args": ["run", "/absolute/path/to/conversation_search.py", "serve", "--pattern", "<pattern>"]
     }
   }
 }
@@ -53,6 +53,26 @@ The `--pattern` flag is **required**. It's a glob matched against directory name
 | `-home-gbr-work-ai-*` | All AI projects |
 
 Restart Claude Code after editing `.mcp.json`.
+
+## CLI Usage
+
+The tool can also be used directly from the command line for scripting and debugging:
+
+```bash
+# Search conversations (--pattern defaults to '*')
+uv run conversation_search.py search --query "heartbeat" --limit 5
+
+# List conversations
+uv run conversation_search.py list --project "claude" --limit 10
+
+# Read a specific turn (full fidelity)
+uv run conversation_search.py read-turn --session-id "<uuid>" --turn 5
+
+# Read consecutive turns
+uv run conversation_search.py read-conv --session-id "<uuid>" --offset 0 --limit 10
+```
+
+All CLI commands output pretty-printed JSON to stdout. Index progress is printed to stderr. Use `2>/dev/null` to suppress progress output when piping.
 
 ## Tools
 
