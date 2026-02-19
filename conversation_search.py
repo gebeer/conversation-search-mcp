@@ -21,15 +21,8 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 # ---------------------------------------------------------------------------
-# Module-level globals
+# Constants
 # ---------------------------------------------------------------------------
-_index_lock = threading.Lock()
-_bm25_retriever: bm25s.BM25 | None = None
-_corpus: list[dict] = []
-_conversations: dict[str, dict] = {}
-_session_files: dict[str, Path] = {}
-_pattern: str = ""
-
 _PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 
 mcp_server = FastMCP("conversation-search", instructions="""\
@@ -427,162 +420,157 @@ def _build_index(pattern: str) -> tuple[list[dict], bm25s.BM25 | None, dict[str,
 
 
 # ---------------------------------------------------------------------------
-# TASK 3: MCP Tools
+# Core index class
 # ---------------------------------------------------------------------------
 
-@mcp_server.tool()
-def search_conversations(
-    query: str,
-    limit: int = 10,
-    session_id: str | None = None,
-    project: str | None = None,
-) -> str:
-    """BM25 keyword search across all conversation turns.
 
-    Args:
-        query: Search query string.
-        limit: Maximum number of results to return.
-        session_id: Optional filter to restrict results to a specific session.
-        project: Optional filter to restrict results to a specific project (substring match).
-    """
-    with _index_lock:
-        retriever = _bm25_retriever
-        corpus = _corpus
+class ConversationIndex:
+    """In-memory BM25 index over JSONL conversation transcripts."""
 
-    if retriever is None or not corpus:
-        return json.dumps({"results": [], "query": query, "total": 0})
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._retriever: bm25s.BM25 | None = None
+        self._corpus: list[dict] = []
+        self._conversations: dict[str, dict] = {}
+        self._session_files: dict[str, Path] = {}
 
-    query_tokens = bm25s.tokenize([query], stopwords="en")
-    # Retrieve more than limit to account for post-retrieval filtering
-    k = min(limit * 3, len(corpus))
-    results, scores = retriever.retrieve(query_tokens, k=k)
+    def build(self, pattern: str) -> None:
+        """Build or rebuild the index from matching directories."""
+        corpus, retriever, conversations, session_files = _build_index(pattern)
+        with self._lock:
+            self._corpus = corpus
+            self._retriever = retriever
+            self._conversations = conversations
+            self._session_files = session_files
 
-    search_results: list[dict] = []
-    for i in range(results.shape[1]):
-        if len(search_results) >= limit:
-            break
-        doc_idx = results[0, i]
-        score = float(scores[0, i])
-        if score <= 0:
-            continue
-        entry = corpus[doc_idx]
-        # Apply filters
-        if session_id and entry.get("session_id") != session_id:
-            continue
-        if project and project.lower() not in entry.get("project", "").lower():
-            continue
-        search_results.append({
-            "session_id": entry["session_id"],
-            "project": entry.get("project", ""),
-            "turn_number": entry["turn_number"],
-            "score": round(score, 4),
-            "snippet": entry["text"][:300],
-            "timestamp": entry.get("timestamp", ""),
-        })
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        session_id: str | None = None,
+        project: str | None = None,
+    ) -> dict:
+        """BM25 keyword search across all conversation turns.
 
-    return json.dumps({"results": search_results, "query": query, "total": len(search_results)})
+        Returns dict with 'results', 'query', 'total'.
+        """
+        with self._lock:
+            retriever = self._retriever
+            corpus = self._corpus
 
+        if retriever is None or not corpus:
+            return {"results": [], "query": query, "total": 0}
 
-@mcp_server.tool()
-def list_conversations(project: str | None = None, limit: int = 50) -> str:
-    """List all indexed conversations with metadata.
+        query_tokens = bm25s.tokenize([query], stopwords="en")
+        k = min(limit * 3, len(corpus))
+        results, scores = retriever.retrieve(query_tokens, k=k)
 
-    Args:
-        project: Optional substring filter for project name.
-        limit: Maximum number of conversations to return.
-    """
-    with _index_lock:
-        conversations = _conversations
+        search_results: list[dict] = []
+        for i in range(results.shape[1]):
+            if len(search_results) >= limit:
+                break
+            doc_idx = results[0, i]
+            score = float(scores[0, i])
+            if score <= 0:
+                continue
+            entry = corpus[doc_idx]
+            if session_id and entry.get("session_id") != session_id:
+                continue
+            if project and project.lower() not in entry.get("project", "").lower():
+                continue
+            search_results.append({
+                "session_id": entry["session_id"],
+                "project": entry.get("project", ""),
+                "turn_number": entry["turn_number"],
+                "score": round(score, 4),
+                "snippet": entry["text"][:300],
+                "timestamp": entry.get("timestamp", ""),
+            })
 
-    conv_list = []
-    for sid, meta in conversations.items():
-        if project and project.lower() not in meta.get("project", "").lower():
-            continue
-        conv_list.append({"session_id": sid, **meta})
+        return {"results": search_results, "query": query, "total": len(search_results)}
 
-    conv_list.sort(key=lambda c: c.get("last_timestamp", ""), reverse=True)
-    conv_list = conv_list[:limit]
+    def list_conversations(
+        self,
+        project: str | None = None,
+        limit: int = 50,
+    ) -> dict:
+        """List indexed sessions. Returns dict with 'conversations', 'total'."""
+        with self._lock:
+            conversations = dict(self._conversations)
 
-    return json.dumps({"conversations": conv_list, "total": len(conv_list)})
+        conv_list = []
+        for sid, meta in conversations.items():
+            if project and project.lower() not in meta.get("project", "").lower():
+                continue
+            conv_list.append({"session_id": sid, **meta})
 
+        conv_list.sort(key=lambda c: c.get("last_timestamp", ""), reverse=True)
+        conv_list = conv_list[:limit]
 
-@mcp_server.tool()
-def read_turn(session_id: str, turn_number: int) -> str:
-    """Read a specific turn from a conversation with full fidelity.
+        return {"conversations": conv_list, "total": len(conv_list)}
 
-    Args:
-        session_id: The session UUID to read from.
-        turn_number: Zero-based turn index.
-    """
-    with _index_lock:
-        session_files = _session_files
+    def read_turn(self, session_id: str, turn_number: int) -> dict:
+        """Full-fidelity read of a single turn."""
+        with self._lock:
+            session_files = dict(self._session_files)
 
-    jsonl_path = session_files.get(session_id)
-    if jsonl_path is None:
-        return json.dumps({"error": f"Unknown session_id: {session_id}"})
+        jsonl_path = session_files.get(session_id)
+        if jsonl_path is None:
+            return {"error": f"Unknown session_id: {session_id}"}
 
-    turns = _reparse_turns(jsonl_path)
+        turns = _reparse_turns(jsonl_path)
 
-    if turn_number < 0 or turn_number >= len(turns):
-        return json.dumps({
-            "error": f"Turn {turn_number} out of range (session has {len(turns)} turns)"
-        })
+        if turn_number < 0 or turn_number >= len(turns):
+            return {"error": f"Turn {turn_number} out of range (session has {len(turns)} turns)"}
 
-    turn = turns[turn_number]
-    return json.dumps({
-        "session_id": turn["session_id"],
-        "turn_number": turn["turn_number"],
-        "timestamp": turn["timestamp"],
-        "user_text": turn["user_text"],
-        "assistant_text": turn["assistant_text"],
-        "tools_used": turn["tools_used"],
-    })
+        turn = turns[turn_number]
+        return {
+            "session_id": turn["session_id"],
+            "turn_number": turn["turn_number"],
+            "timestamp": turn["timestamp"],
+            "user_text": turn["user_text"],
+            "assistant_text": turn["assistant_text"],
+            "tools_used": turn["tools_used"],
+        }
 
+    def read_conversation(
+        self,
+        session_id: str,
+        offset: int = 0,
+        limit: int = 10,
+    ) -> dict:
+        """Paginated reading of turns from a session."""
+        with self._lock:
+            session_files = dict(self._session_files)
+            conversations = dict(self._conversations)
 
-@mcp_server.tool()
-def read_conversation(
-    session_id: str,
-    offset: int = 0,
-    limit: int = 10,
-) -> str:
-    """Read multiple turns from a conversation.
+        jsonl_path = session_files.get(session_id)
+        if jsonl_path is None:
+            return {"error": f"Unknown session_id: {session_id}"}
 
-    Args:
-        session_id: The session UUID to read from.
-        offset: Zero-based starting turn index.
-        limit: Number of turns to return.
-    """
-    with _index_lock:
-        session_files = _session_files
-        conversations = _conversations
+        meta = conversations.get(session_id, {})
+        turns = _reparse_turns(jsonl_path)
+        sliced = turns[offset : offset + limit]
 
-    jsonl_path = session_files.get(session_id)
-    if jsonl_path is None:
-        return json.dumps({"error": f"Unknown session_id: {session_id}"})
-
-    meta = conversations.get(session_id, {})
-    turns = _reparse_turns(jsonl_path)
-    sliced = turns[offset : offset + limit]
-
-    return json.dumps({
-        "session_id": session_id,
-        "project": meta.get("project", ""),
-        "cwd": meta.get("cwd", ""),
-        "git_branch": meta.get("git_branch", ""),
-        "total_turns": len(turns),
-        "offset": offset,
-        "limit": limit,
-        "turns": [
-            {
-                "turn_number": t["turn_number"],
-                "timestamp": t["timestamp"],
-                "user_text": t["user_text"],
-                "assistant_text": t["assistant_text"],
-                "tools_used": t["tools_used"],
-            }
-            for t in sliced
-        ],
-    })
+        return {
+            "session_id": session_id,
+            "project": meta.get("project", ""),
+            "cwd": meta.get("cwd", ""),
+            "git_branch": meta.get("git_branch", ""),
+            "total_turns": len(turns),
+            "offset": offset,
+            "limit": limit,
+            "turns": [
+                {
+                    "turn_number": t["turn_number"],
+                    "timestamp": t["timestamp"],
+                    "user_text": t["user_text"],
+                    "assistant_text": t["assistant_text"],
+                    "tools_used": t["tools_used"],
+                }
+                for t in sliced
+            ],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -592,8 +580,9 @@ def read_conversation(
 class _ConvChangeHandler(FileSystemEventHandler):
     """Watches a project directory for JSONL changes and triggers reindex."""
 
-    def __init__(self, pattern: str) -> None:
+    def __init__(self, pattern: str, index: ConversationIndex) -> None:
         self._pattern = pattern
+        self._index = index
         self._debounce_timer: threading.Timer | None = None
         self._debounce_lock = threading.Lock()
 
@@ -606,13 +595,7 @@ class _ConvChangeHandler(FileSystemEventHandler):
             self._debounce_timer.start()
 
     def _do_reindex(self) -> None:
-        global _bm25_retriever, _corpus, _conversations, _session_files
-        corpus, retriever, conversations, session_files = _build_index(self._pattern)
-        with _index_lock:
-            _corpus = corpus
-            _bm25_retriever = retriever
-            _conversations = conversations
-            _session_files = session_files
+        self._index.build(self._pattern)
 
     def _maybe_reindex(self, path: str) -> None:
         if not path.endswith(".jsonl"):
@@ -676,45 +659,141 @@ class _DirDiscoveryHandler(FileSystemEventHandler):
             self._schedule_check(event.src_path)
 
 
-def main() -> None:
-    global _bm25_retriever, _corpus, _conversations, _session_files, _pattern
+def _run_mcp_server(pattern: str) -> None:
+    """Start the MCP server with filesystem watchers."""
+    index = ConversationIndex()
+    index.build(pattern)
 
-    parser = argparse.ArgumentParser(
-        description="MCP server for searching Claude Code conversation transcripts"
-    )
-    parser.add_argument(
-        "--pattern",
-        required=True,
-        help="Glob pattern for project directories under ~/.claude/projects/ (e.g. '*' for all, '-home-gbr-work-*' for a subtree)",
-    )
-    args = parser.parse_args()
-    _pattern = args.pattern
-
-    # Initial index build
-    corpus, retriever, conversations, session_files = _build_index(_pattern)
-    with _index_lock:
-        _corpus = corpus
-        _bm25_retriever = retriever
-        _conversations = conversations
-        _session_files = session_files
-
-    # Set up filesystem watchers
-    conv_handler = _ConvChangeHandler(_pattern)
+    # Filesystem watchers
+    conv_handler = _ConvChangeHandler(pattern, index)
     observer = Observer()
     observer.daemon = True
 
-    # Watch each matching project directory for JSONL changes
-    directories = _discover_directories(_pattern)
+    directories = _discover_directories(pattern)
     for d in directories:
         observer.schedule(conv_handler, str(d), recursive=False)
 
-    # Watch parent directory for new project directories
-    dir_discovery = _DirDiscoveryHandler(_pattern, observer, conv_handler)
+    dir_discovery = _DirDiscoveryHandler(pattern, observer, conv_handler)
     dir_discovery._watched_dirs = {str(d) for d in directories}
     observer.schedule(dir_discovery, str(_PROJECTS_ROOT), recursive=False)
 
     observer.start()
+
+    # MCP tool registration — thin wrappers around index methods
+    @mcp_server.tool()
+    def search_conversations(
+        query: str,
+        limit: int = 10,
+        session_id: str | None = None,
+        project: str | None = None,
+    ) -> str:
+        """BM25 keyword search across all conversation turns.
+
+        Args:
+            query: Search query string.
+            limit: Maximum number of results to return.
+            session_id: Optional filter to restrict results to a specific session.
+            project: Optional filter to restrict results to a specific project (substring match).
+        """
+        return json.dumps(index.search(query, limit, session_id, project))
+
+    @mcp_server.tool()
+    def list_conversations(project: str | None = None, limit: int = 50) -> str:
+        """List all indexed conversations with metadata.
+
+        Args:
+            project: Optional substring filter for project name.
+            limit: Maximum number of conversations to return.
+        """
+        return json.dumps(index.list_conversations(project, limit))
+
+    @mcp_server.tool()
+    def read_turn(session_id: str, turn_number: int) -> str:
+        """Read a specific turn from a conversation with full fidelity.
+
+        Args:
+            session_id: The session UUID to read from.
+            turn_number: Zero-based turn index.
+        """
+        return json.dumps(index.read_turn(session_id, turn_number))
+
+    @mcp_server.tool()
+    def read_conversation(
+        session_id: str,
+        offset: int = 0,
+        limit: int = 10,
+    ) -> str:
+        """Read multiple turns from a conversation.
+
+        Args:
+            session_id: The session UUID to read from.
+            offset: Zero-based starting turn index.
+            limit: Number of turns to return.
+        """
+        return json.dumps(index.read_conversation(session_id, offset, limit))
+
     mcp_server.run()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="BM25 search over Claude Code conversation transcripts"
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # --- serve (MCP mode) ---
+    serve_parser = subparsers.add_parser("serve", help="Run as MCP server")
+    serve_parser.add_argument(
+        "--pattern",
+        default="*",
+        help="Glob pattern for project directories under ~/.claude/projects/ (default: '*')",
+    )
+
+    # --- search ---
+    search_parser = subparsers.add_parser("search", help="Search conversations")
+    search_parser.add_argument("--pattern", default="*")
+    search_parser.add_argument("--query", "-q", required=True, help="Search query")
+    search_parser.add_argument("--limit", "-n", type=int, default=10)
+    search_parser.add_argument("--session-id", default=None)
+    search_parser.add_argument("--project", "-p", default=None)
+
+    # --- list ---
+    list_parser = subparsers.add_parser("list", help="List conversations")
+    list_parser.add_argument("--pattern", default="*")
+    list_parser.add_argument("--project", "-p", default=None)
+    list_parser.add_argument("--limit", "-n", type=int, default=50)
+
+    # --- read-turn ---
+    rt_parser = subparsers.add_parser("read-turn", help="Read a specific turn")
+    rt_parser.add_argument("--pattern", default="*")
+    rt_parser.add_argument("--session-id", required=True)
+    rt_parser.add_argument("--turn", type=int, required=True, help="Zero-based turn number")
+
+    # --- read-conv ---
+    rc_parser = subparsers.add_parser("read-conv", help="Read consecutive turns")
+    rc_parser.add_argument("--pattern", default="*")
+    rc_parser.add_argument("--session-id", required=True)
+    rc_parser.add_argument("--offset", type=int, default=0)
+    rc_parser.add_argument("--limit", "-n", type=int, default=10)
+
+    args = parser.parse_args()
+
+    if args.command == "serve":
+        _run_mcp_server(args.pattern)
+    else:
+        index = ConversationIndex()
+        index.build(args.pattern)
+
+        if args.command == "search":
+            result = index.search(args.query, args.limit, args.session_id, args.project)
+        elif args.command == "list":
+            result = index.list_conversations(args.project, args.limit)
+        elif args.command == "read-turn":
+            result = index.read_turn(args.session_id, args.turn)
+        elif args.command == "read-conv":
+            result = index.read_conversation(args.session_id, args.offset, args.limit)
+
+        print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
