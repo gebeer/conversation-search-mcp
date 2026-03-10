@@ -1,23 +1,25 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["bm25s", "mcp", "uvicorn", "watchdog"]
+# dependencies = ["mcp", "uvicorn", "watchdog"]
 # ///
-"""MCP server that indexes Claude Code JSONL conversation transcripts with BM25."""
+"""MCP server that indexes Claude Code JSONL conversation transcripts with SQLite FTS5."""
 
 from __future__ import annotations
 
 import argparse
 import fnmatch
 import json
+import math
 import os
 import re
 import socket
+import sqlite3
 import sys
 import threading
+import time
 from pathlib import Path
 
-import bm25s
 from mcp.server.fastmcp import FastMCP
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -28,18 +30,27 @@ from watchdog.observers import Observer
 _PROJECTS_ROOT = Path(os.environ["CONVERSATION_SEARCH_PROJECTS_ROOT"]) if os.environ.get("CONVERSATION_SEARCH_PROJECTS_ROOT") else Path.home() / ".claude" / "projects"
 
 mcp_server = FastMCP("conversation-search", instructions="""\
-BM25 keyword search over Claude Code conversation history (JSONL transcripts from ~/.claude/projects/).
+FTS5 full-text search over Claude Code conversation history (JSONL transcripts from ~/.claude/projects/).
 
 Workflow — search wide, then read deep:
-1. search_conversations: Find relevant turns by keyword. Uses BM25, so prefer specific terms over vague queries. Returns snippets (300 chars) with session_id and turn_number.
+1. search_conversations: Find relevant turns by keyword. Uses FTS5 full-text search with porter stemming. Returns snippets with session_id and turn_number.
 2. list_conversations: Browse sessions with metadata (project, summary, timestamps, cwd). Filter by project substring.
 3. read_turn: Retrieve one turn in full fidelity (complete user text, assistant text, tools used). Use session_id + turn_number from search results.
 4. read_conversation: Paginated reading of consecutive turns from a session. Use for context around a specific turn.
 
+FTS5 query syntax:
+- Implicit AND: multiple terms must all appear (e.g., "graphiti migration")
+- Phrase search: quoted phrases match exactly (e.g., '"sqlite fts5"')
+- Boolean: OR and NOT operators (e.g., "graphiti OR falkor", "memory NOT cache")
+- Prefix: term* matches any word with that prefix (e.g., "migrat*")
+- Grouping: parentheses for complex queries (e.g., "(graphiti OR falkor) memory")
+- Results are ranked by BM25 score with a recency boost (recent sessions score higher).
+- Snippets show ~24 words of context around the match, with **bold** markers.
+
 Key details:
 - A "turn" is one user message paired with the full assistant response (text + tool calls).
 - The "project" filter is a substring match against encoded directory names (e.g., "hugoerke" matches "home-gbr-work-001-sites-hugoerke-local").
-- Search results are ranked by BM25 score. Retrieve more than you need (raise limit) when filtering by session or project, as filtering happens post-retrieval.
+- When filtering by session or project, raise the limit since post-retrieval filtering reduces the result count.
 - Timestamps are ISO 8601 UTC.
 """)
 
@@ -91,7 +102,7 @@ def _parse_conversation(jsonl_path: Path) -> tuple[list[dict], dict]:
     """Parse a JSONL conversation file into search-ready turns and session metadata.
 
     Returns (turns, session_metadata) where each turn has a 'text' field
-    suitable for BM25 indexing.
+    suitable for FTS5 indexing.
     """
     session_id = jsonl_path.stem
     turns: list[dict] = []
@@ -340,7 +351,7 @@ def _reparse_turns(jsonl_path: Path) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Multi-directory discovery and BM25 indexing
+# Multi-directory discovery and FTS5 indexing
 # ---------------------------------------------------------------------------
 
 def _discover_directories(pattern: str) -> list[Path]:
@@ -391,112 +402,193 @@ def _derive_project_name(dir_name: str, all_dir_names: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# SQLite helpers
+# ---------------------------------------------------------------------------
+
+_DAEMON_CACHE_DIR = Path(os.environ["CONVERSATION_SEARCH_CACHE_DIR"]) if os.environ.get("CONVERSATION_SEARCH_CACHE_DIR") else Path.home() / ".cache" / "conversation-search"
+_DB_PATH = _DAEMON_CACHE_DIR / "index.db"
+
+
+def _create_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id   TEXT PRIMARY KEY,
+            file_path    TEXT NOT NULL,
+            project      TEXT NOT NULL DEFAULT '',
+            slug         TEXT NOT NULL DEFAULT '',
+            summary      TEXT NOT NULL DEFAULT '',
+            cwd          TEXT NOT NULL DEFAULT '',
+            git_branch   TEXT NOT NULL DEFAULT '',
+            first_ts     TEXT NOT NULL DEFAULT '',
+            last_ts      TEXT NOT NULL DEFAULT '',
+            turn_count   INTEGER NOT NULL DEFAULT 0,
+            mtime        REAL NOT NULL DEFAULT 0,
+            size         INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
+            text,
+            session_id UNINDEXED,
+            turn_number UNINDEXED,
+            project UNINDEXED,
+            timestamp UNINDEXED,
+            tokenize='porter unicode61'
+        );
+    """)
+    conn.commit()
+
+
+def _age_in_days(ts: str, now: float) -> float:
+    """Convert ISO 8601 timestamp to age in days from now."""
+    if not ts:
+        return 365.0  # Unknown timestamp = old
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return max(0, (now - dt.timestamp()) / 86400)
+    except (ValueError, OSError):
+        return 365.0
+
+
+# ---------------------------------------------------------------------------
 # Core index class
 # ---------------------------------------------------------------------------
 
-# Type alias for the per-file cache entry: (mtime, size, turns, metadata)
-_CacheEntry = tuple[float, int, list[dict], dict]
-
 
 class ConversationIndex:
-    """In-memory BM25 index over JSONL conversation transcripts."""
+    """SQLite FTS5 index over JSONL conversation transcripts."""
 
-    def __init__(self) -> None:
+    def __init__(self, db_path: Path | None = None) -> None:
+        self._db_path = db_path or _DB_PATH
         self._lock = threading.Lock()
-        self._retriever: bm25s.BM25 | None = None
-        self._corpus: list[dict] = []
-        self._conversations: dict[str, dict] = {}
-        self._session_files: dict[str, Path] = {}
-        # Incremental cache: path_str -> (mtime, size, turns, metadata)
-        self._file_cache: dict[str, _CacheEntry] = {}
+        self._conn: sqlite3.Connection | None = None
+
+    def _get_connection(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._conn = self._open_db()
+        return self._conn
+
+    def _open_db(self) -> sqlite3.Connection:
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=-8000")
+        _create_schema(conn)
+        return conn
 
     def build(self, pattern: str) -> None:
         """Build or rebuild the index from matching directories.
 
-        Uses incremental caching: only reparses JSONL files whose mtime or
-        size changed since the last build. Unchanged files reuse cached
-        parsed turns, avoiding redundant JSON parsing of the full corpus.
+        Uses incremental indexing: checks mtime/size against sessions table.
+        Unchanged files are skipped. Changed or new files are fully re-indexed.
+        Sessions for deleted files are removed.
         """
-        # Snapshot the previous cache under lock
-        with self._lock:
-            old_cache = dict(self._file_cache)
-
         directories = _discover_directories(pattern)
         all_dir_names = [d.name for d in directories]
 
-        corpus: list[dict] = []
-        conversations: dict[str, dict] = {}
-        session_files: dict[str, Path] = {}
-        new_cache: dict[str, _CacheEntry] = {}
+        with self._lock:
+            conn = self._get_connection()
 
+        # Load existing session mtime/size for incremental check
+        existing: dict[str, tuple[float, int]] = {}
+        for row in conn.execute("SELECT file_path, mtime, size FROM sessions"):
+            existing[row[0]] = (row[1], row[2])
+
+        seen_paths: set[str] = set()
         file_count = 0
         cache_hits = 0
 
-        for directory in directories:
-            project = _derive_project_name(directory.name, all_dir_names)
-            for jsonl_path in sorted(directory.glob("*.jsonl")):
-                # Skip subagent session files (defensive — glob is non-recursive
-                # so these shouldn't appear, but guard against edge cases)
-                if jsonl_path.name.startswith("agent-"):
-                    continue
+        with self._lock:
+            for directory in directories:
+                project = _derive_project_name(directory.name, all_dir_names)
+                for jsonl_path in sorted(directory.glob("*.jsonl")):
+                    if jsonl_path.name.startswith("agent-"):
+                        continue
 
-                file_count += 1
-                session_id = jsonl_path.stem
-                path_key = str(jsonl_path)
+                    file_count += 1
+                    session_id = jsonl_path.stem
+                    path_key = str(jsonl_path)
+                    seen_paths.add(path_key)
 
-                try:
-                    stat = jsonl_path.stat()
-                    mtime = stat.st_mtime
-                    size = stat.st_size
-                except OSError:
-                    continue
+                    try:
+                        stat = jsonl_path.stat()
+                        mtime = stat.st_mtime
+                        size = stat.st_size
+                    except OSError:
+                        continue
 
-                # Check cache: reuse parsed data if file unchanged
-                cached = old_cache.get(path_key)
-                if cached is not None and cached[0] == mtime and cached[1] == size:
-                    # Shallow-copy each turn dict to avoid mutating cached data
-                    turns = [dict(t) for t in cached[2]]
-                    metadata = dict(cached[3])
-                    cache_hits += 1
-                else:
+                    # Check if file is unchanged
+                    cached = existing.get(path_key)
+                    if cached is not None and cached[0] == mtime and cached[1] == size:
+                        cache_hits += 1
+                        continue
+
+                    # File changed or is new — re-index it
                     turns, metadata = _parse_conversation(jsonl_path)
 
-                # Attach project label to turns and metadata
-                for turn in turns:
-                    turn["project"] = project
-                metadata["project"] = project
+                    # Remove old rows for this session
+                    conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+                    conn.execute("DELETE FROM turns_fts WHERE session_id = ?", (session_id,))
 
-                # Store original (un-mutated) turns in cache for safe reuse
-                cache_turns = [
-                    {k: v for k, v in t.items() if k != "project"} for t in turns
-                ]
-                new_cache[path_key] = (mtime, size, cache_turns, metadata)
-                conversations[session_id] = metadata
-                session_files[session_id] = jsonl_path
-                corpus.extend(turns)
+                    # Insert session metadata
+                    conn.execute(
+                        """INSERT INTO sessions
+                           (session_id, file_path, project, slug, summary, cwd, git_branch,
+                            first_ts, last_ts, turn_count, mtime, size)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            session_id,
+                            path_key,
+                            project,
+                            metadata.get("slug", ""),
+                            metadata.get("summary", ""),
+                            metadata.get("cwd", ""),
+                            metadata.get("git_branch", ""),
+                            metadata.get("first_timestamp", ""),
+                            metadata.get("last_timestamp", ""),
+                            metadata.get("turn_count", 0),
+                            mtime,
+                            size,
+                        ),
+                    )
 
-        retriever = None
-        if corpus:
-            corpus_tokens = bm25s.tokenize(
-                [entry["text"] for entry in corpus], stopwords="en"
-            )
-            retriever = bm25s.BM25()
-            retriever.index(corpus_tokens)
+                    # Insert turns into FTS table
+                    for turn in turns:
+                        conn.execute(
+                            "INSERT INTO turns_fts (text, session_id, turn_number, project, timestamp) VALUES (?, ?, ?, ?, ?)",
+                            (
+                                turn["text"],
+                                session_id,
+                                turn["turn_number"],
+                                project,
+                                turn.get("timestamp", ""),
+                            ),
+                        )
+
+            conn.commit()
+
+            # Remove sessions for deleted files
+            stale = [p for p in existing if p not in seen_paths]
+            if stale:
+                for path_key in stale:
+                    # Look up session_id by file_path to clean turns_fts
+                    row = conn.execute(
+                        "SELECT session_id FROM sessions WHERE file_path = ?", (path_key,)
+                    ).fetchone()
+                    if row:
+                        conn.execute("DELETE FROM turns_fts WHERE session_id = ?", (row[0],))
+                    conn.execute("DELETE FROM sessions WHERE file_path = ?", (path_key,))
+                conn.commit()
+
+            conn.execute("INSERT INTO turns_fts(turns_fts) VALUES('optimize')")
+            conn.commit()
 
         parsed = file_count - cache_hits
         print(
             f"Indexed {len(directories)} dirs, {file_count} files "
-            f"({cache_hits} cached, {parsed} parsed), "
-            f"{len(corpus)} turns",
+            f"({cache_hits} cached, {parsed} parsed)",
             file=sys.stderr,
         )
-
-        with self._lock:
-            self._corpus = corpus
-            self._retriever = retriever
-            self._conversations = conversations
-            self._session_files = session_files
-            self._file_cache = new_cache
 
     def search(
         self,
@@ -505,41 +597,61 @@ class ConversationIndex:
         session_id: str | None = None,
         project: str | None = None,
     ) -> dict:
-        """BM25 keyword search across all conversation turns.
+        """FTS5 full-text search across all conversation turns.
 
         Returns dict with 'results', 'query', 'total'.
         """
         with self._lock:
-            retriever = self._retriever
-            corpus = self._corpus
+            conn = self._get_connection()
 
-        if retriever is None or not corpus:
-            return {"results": [], "query": query, "total": 0}
+        now = time.time()
+        fetch_limit = min(limit * 3, 500)
 
-        query_tokens = bm25s.tokenize([query], stopwords="en")
-        k = min(limit * 3, len(corpus))
-        results, scores = retriever.retrieve(query_tokens, k=k)
+        sql = """
+            SELECT
+                turns_fts.session_id,
+                turns_fts.turn_number,
+                turns_fts.project,
+                turns_fts.timestamp,
+                snippet(turns_fts, 0, '**', '**', '...', 24) AS snippet,
+                rank AS bm25_rank
+            FROM turns_fts
+            WHERE turns_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+        """
+
+        try:
+            rows = conn.execute(sql, (query, fetch_limit)).fetchall()
+        except sqlite3.OperationalError as exc:
+            # Bad FTS5 query syntax — return empty with error message
+            return {"results": [], "query": query, "total": 0, "error": str(exc)}
 
         search_results: list[dict] = []
-        for i in range(results.shape[1]):
+        for row in rows:
             if len(search_results) >= limit:
                 break
-            doc_idx = results[0, i]
-            score = float(scores[0, i])
-            if score <= 0:
+
+            sid, turn_number, proj, ts, snippet_text, bm25_rank = row
+
+            if session_id and sid != session_id:
                 continue
-            entry = corpus[doc_idx]
-            if session_id and entry.get("session_id") != session_id:
+            if project and project.lower() not in (proj or "").lower():
                 continue
-            if project and project.lower() not in entry.get("project", "").lower():
-                continue
+
+            # Recency boost: blend BM25 score with exponential decay
+            bm25_score = -bm25_rank  # FTS5 rank is negative; negate for positive score
+            age_days = _age_in_days(ts, now)
+            recency = math.exp(-0.693 * age_days / 30)  # half-life = 30 days
+            blended = bm25_score * (1 + 0.2 * recency)
+
             search_results.append({
-                "session_id": entry["session_id"],
-                "project": entry.get("project", ""),
-                "turn_number": entry["turn_number"],
-                "score": round(score, 4),
-                "snippet": entry["text"][:300],
-                "timestamp": entry.get("timestamp", ""),
+                "session_id": sid,
+                "project": proj or "",
+                "turn_number": turn_number,
+                "score": round(blended, 4),
+                "snippet": snippet_text or "",
+                "timestamp": ts or "",
             })
 
         return {"results": search_results, "query": query, "total": len(search_results)}
@@ -551,28 +663,57 @@ class ConversationIndex:
     ) -> dict:
         """List indexed sessions. Returns dict with 'conversations', 'total'."""
         with self._lock:
-            conversations = dict(self._conversations)
+            conn = self._get_connection()
 
-        conv_list = []
-        for sid, meta in conversations.items():
-            if project and project.lower() not in meta.get("project", "").lower():
-                continue
-            conv_list.append({"session_id": sid, **meta})
+        if project:
+            rows = conn.execute(
+                """SELECT session_id, project, slug, summary, cwd, git_branch,
+                          first_ts, last_ts, turn_count
+                   FROM sessions
+                   WHERE project LIKE ?
+                   ORDER BY last_ts DESC
+                   LIMIT ?""",
+                (f"%{project}%", limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT session_id, project, slug, summary, cwd, git_branch,
+                          first_ts, last_ts, turn_count
+                   FROM sessions
+                   ORDER BY last_ts DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
 
-        conv_list.sort(key=lambda c: c.get("last_timestamp", ""), reverse=True)
-        conv_list = conv_list[:limit]
+        conv_list = [
+            {
+                "session_id": row[0],
+                "project": row[1],
+                "slug": row[2],
+                "summary": row[3],
+                "cwd": row[4],
+                "git_branch": row[5],
+                "first_timestamp": row[6],
+                "last_timestamp": row[7],
+                "turn_count": row[8],
+            }
+            for row in rows
+        ]
 
         return {"conversations": conv_list, "total": len(conv_list)}
 
     def read_turn(self, session_id: str, turn_number: int) -> dict:
         """Full-fidelity read of a single turn."""
         with self._lock:
-            session_files = dict(self._session_files)
+            conn = self._get_connection()
 
-        jsonl_path = session_files.get(session_id)
-        if jsonl_path is None:
+        row = conn.execute(
+            "SELECT file_path FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
             return {"error": f"Unknown session_id: {session_id}"}
 
+        jsonl_path = Path(row[0])
         turns = _reparse_turns(jsonl_path)
 
         if turn_number < 0 or turn_number >= len(turns):
@@ -596,22 +737,26 @@ class ConversationIndex:
     ) -> dict:
         """Paginated reading of turns from a session."""
         with self._lock:
-            session_files = dict(self._session_files)
-            conversations = dict(self._conversations)
+            conn = self._get_connection()
 
-        jsonl_path = session_files.get(session_id)
-        if jsonl_path is None:
+        row = conn.execute(
+            """SELECT file_path, project, cwd, git_branch
+               FROM sessions WHERE session_id = ?""",
+            (session_id,),
+        ).fetchone()
+        if row is None:
             return {"error": f"Unknown session_id: {session_id}"}
 
-        meta = conversations.get(session_id, {})
+        file_path, project, cwd, git_branch = row
+        jsonl_path = Path(file_path)
         turns = _reparse_turns(jsonl_path)
         sliced = turns[offset : offset + limit]
 
         return {
             "session_id": session_id,
-            "project": meta.get("project", ""),
-            "cwd": meta.get("cwd", ""),
-            "git_branch": meta.get("git_branch", ""),
+            "project": project or "",
+            "cwd": cwd or "",
+            "git_branch": git_branch or "",
             "total_turns": len(turns),
             "offset": offset,
             "limit": limit,
@@ -735,7 +880,6 @@ class _DirDiscoveryHandler(FileSystemEventHandler):
 # Daemon helpers
 # ---------------------------------------------------------------------------
 
-_DAEMON_CACHE_DIR = Path(os.environ["CONVERSATION_SEARCH_CACHE_DIR"]) if os.environ.get("CONVERSATION_SEARCH_CACHE_DIR") else Path.home() / ".cache" / "conversation-search"
 _DEFAULT_PORT = 9237
 _DEFAULT_IDLE_TIMEOUT = 900  # 15 minutes
 
@@ -813,7 +957,6 @@ def _run_daemon(port: int = _DEFAULT_PORT, idle_timeout: float = _DEFAULT_IDLE_T
     Exits after idle_timeout seconds with no MCP tool calls.
     """
     import signal
-    import time
 
     # Check for existing daemon
     state = _read_daemon_state()
@@ -888,7 +1031,7 @@ def _run_daemon(port: int = _DEFAULT_PORT, idle_timeout: float = _DEFAULT_IDLE_T
         session_id: str | None = None,
         project: str | None = None,
     ) -> str:
-        """BM25 keyword search across all conversation turns.
+        """FTS5 full-text search across all conversation turns.
 
         Args:
             query: Search query string.
@@ -979,7 +1122,6 @@ def _run_connect(port: int = _DEFAULT_PORT, idle_timeout: float = _DEFAULT_IDLE_
     Runs until the SSE connection closes or stdin reaches EOF.
     """
     import subprocess
-    import time
     import anyio
 
     sse_url = f"http://127.0.0.1:{port}/sse"
@@ -1058,7 +1200,7 @@ def _register_tools(server: FastMCP, index: ConversationIndex) -> None:
         session_id: str | None = None,
         project: str | None = None,
     ) -> str:
-        """BM25 keyword search across all conversation turns.
+        """FTS5 full-text search across all conversation turns.
 
         Args:
             query: Search query string.
@@ -1131,7 +1273,7 @@ def _run_mcp_server(pattern: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="BM25 search over Claude Code conversation transcripts"
+        description="Full-text search over Claude Code conversation transcripts"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
